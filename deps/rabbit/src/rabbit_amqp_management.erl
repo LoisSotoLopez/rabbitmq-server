@@ -224,25 +224,46 @@ process_http_request(<<"DELETE">>,
     end;
 
 process_http_request(<<"DELETE">>,
-                     <<"/$management/exchanges/", XNameBin/binary>>,
+                     <<"/$management/exchanges/", Path/binary>>,
                      undefined,
                      [],
                      Vhost,
                      #user{username = Username},
                      _ConnectionPid) ->
-    XName = rabbit_misc:r(Vhost, exchange, XNameBin),
-    ok = case rabbit_exchange:delete(XName, false, Username) of
-             ok ->
-                 ok;
-             {error, not_found} ->
-                 ok
-                 %% %% TODO return deletion failure
-                 %% {error, in_use} ->
-         end,
-    Props = #'v1_0.properties'{subject = {utf8, <<"204">>}},
-    AppProps = #'v1_0.application_properties'{content = []},
-    RespPayload = {map, []},
-    {Props, AppProps, RespPayload};
+    case re:split(Path, <<"/">>, [{return, binary}]) of
+        [XNameBin] ->
+            XName = rabbit_misc:r(Vhost, exchange, XNameBin),
+            ok = case rabbit_exchange:delete(XName, false, Username) of
+                     ok ->
+                         ok;
+                     {error, not_found} ->
+                         ok
+                         %% %% TODO return deletion failure
+                         %% {error, in_use} ->
+                 end,
+            Props = #'v1_0.properties'{subject = {utf8, <<"204">>}},
+            AppProps = #'v1_0.application_properties'{content = []},
+            RespPayload = {map, []},
+            {Props, AppProps, RespPayload};
+        [XNameBin, <<"bindings">>, SrcXNameBin, BindingKey, ArgsHash] ->
+            SrcXName = rabbit_misc:r(Vhost, exchange, SrcXNameBin),
+            XName = rabbit_misc:r(Vhost, exchange, XNameBin),
+            Bindings0 = rabbit_binding:list_for_source_and_destination(SrcXName, XName, true),
+            case lists:search(fun(#binding{key = Key,
+                                           args = Args}) ->
+                                      Key =:= BindingKey andalso
+                                      args_hash(Args) =:= ArgsHash
+                              end, Bindings0) of
+                {value, Binding} ->
+                    ok = rabbit_binding:remove(Binding, Username);
+                false ->
+                    ok
+            end,
+            Props = #'v1_0.properties'{subject = {utf8, <<"204">>}},
+            AppProps = #'v1_0.application_properties'{content = []},
+            RespPayload = {map, []},
+            {Props, AppProps, RespPayload}
+    end;
 
 process_http_request(<<"GET">>,
                      <<"/$management/", Path0/binary>>,
