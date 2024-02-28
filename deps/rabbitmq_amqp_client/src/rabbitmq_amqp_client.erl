@@ -14,7 +14,7 @@
         bind_queue/5,
         bind_exchange/5,
         unbind_queue/5,
-        % unbind_exchange/5,
+        unbind_exchange/5,
         purge_queue/2,
         delete_queue/2,
         delete_exchange/2
@@ -232,13 +232,26 @@ bind_exchange(#link_pair{outgoing_link = OutgoingLink,
 
 -spec unbind_queue(link_pair(), binary(), binary(), binary(), #{binary() => amqp10_prim()}) ->
     ok | {error, term()}.
-unbind_queue(LinkPair = #link_pair{outgoing_link = OutgoingLink,
-                                   incoming_link = IncomingLink},
-             QueueName, ExchangeName, BindingKey, BindingArguments) ->
+unbind_queue(LinkPair, QueueName, ExchangeName, BindingKey, BindingArguments) ->
+    unbind(<<"queues">>, LinkPair, QueueName, ExchangeName, BindingKey, BindingArguments).
+
+-spec unbind_exchange(link_pair(), binary(), binary(), binary(), #{binary() => amqp10_prim()}) ->
+    ok | {error, term()}.
+unbind_exchange(LinkPair, DestinationExchange, SourceExchange, BindingKey, BindingArguments) ->
+    unbind(<<"exchanges">>, LinkPair, DestinationExchange, SourceExchange, BindingKey, BindingArguments).
+
+-spec unbind(binary(), link_pair(), binary(), binary(), binary(), #{binary() => amqp10_prim()}) ->
+    ok | {error, term()}.
+unbind(Type,
+       #link_pair{outgoing_link = OutgoingLink,
+                  incoming_link = IncomingLink} = LinkPair,
+       Destination, Source, BindingKey, BindingArguments) ->
     MessageId = message_id(),
     HttpMethod = <<"GET">>,
-    HttpRequestTarget = <<"/$management/queues/", QueueName/binary,
-                          "/$management/bindings?source=", ExchangeName/binary>>,
+    HttpRequestTarget = <<"/$management/",
+                          Type/binary, "/",
+                          Destination/binary,
+                          "/$management/bindings?source=", Source/binary>>,
     Props = #{message_id => {binary, MessageId},
               to => HttpRequestTarget,
               subject => HttpMethod,
@@ -261,7 +274,7 @@ unbind_queue(LinkPair = #link_pair{outgoing_link = OutgoingLink,
         [{list, Bindings}] = amqp10_framing:decode_bin(RespBody),
         case binding_uri(BindingKey, BindingArguments, Bindings) of
             {ok, Uri} ->
-                ok = delete_queue_binding(LinkPair, Uri);
+                ok = delete_binding(LinkPair, Uri);
             not_found ->
                 ok
         end
@@ -287,10 +300,10 @@ binding_uri(BindingKey, BindingArguments, [{map, KVList} | Bindings]) ->
             binding_uri(BindingKey, BindingArguments, Bindings)
     end.
 
--spec delete_queue_binding(link_pair(), binary()) ->
+-spec delete_binding(link_pair(), binary()) ->
     ok | {error, term()}.
-delete_queue_binding(#link_pair{outgoing_link = OutgoingLink,
-                                incoming_link = IncomingLink}, BindingUri) ->
+delete_binding(#link_pair{outgoing_link = OutgoingLink,
+                          incoming_link = IncomingLink}, BindingUri) ->
     MessageId = message_id(),
     HttpMethod = <<"DELETE">>,
     Props = #{message_id => {binary, MessageId},

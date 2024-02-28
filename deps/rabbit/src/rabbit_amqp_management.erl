@@ -245,10 +245,10 @@ process_http_request(<<"DELETE">>,
             AppProps = #'v1_0.application_properties'{content = []},
             RespPayload = {map, []},
             {Props, AppProps, RespPayload};
-        [XNameBin, <<"bindings">>, SrcXNameBin, BindingKey, ArgsHash] ->
+        [DstXNameBin, <<"bindings">>, SrcXNameBin, BindingKey, ArgsHash] ->
             SrcXName = rabbit_misc:r(Vhost, exchange, SrcXNameBin),
-            XName = rabbit_misc:r(Vhost, exchange, XNameBin),
-            Bindings0 = rabbit_binding:list_for_source_and_destination(SrcXName, XName, true),
+            DstXName = rabbit_misc:r(Vhost, exchange, DstXNameBin),
+            Bindings0 = rabbit_binding:list_for_source_and_destination(SrcXName, DstXName, true),
             case lists:search(fun(#binding{key = Key,
                                            args = Args}) ->
                                       Key =:= BindingKey andalso

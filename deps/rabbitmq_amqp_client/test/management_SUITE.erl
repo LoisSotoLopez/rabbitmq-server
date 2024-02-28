@@ -132,12 +132,17 @@ all_management_operations(Config) ->
     ok = amqp10_client:send_msg(Sender4, Msg4),
     ok = wait_for_accepted(DTag5),
 
+    ?assertEqual(ok, rabbitmq_amqp_client:unbind_exchange(LinkPair, XName, SourceExchange, BindingKey2, #{})),
+    DTag6 = <<"tag 6">>,
+    ok = amqp10_client:send_msg(Sender4, amqp10_msg:new(DTag6, <<"not routed">>, false)),
+    ok = wait_for_settlement(DTag6, released),
+
     ?assertEqual(ok, rabbitmq_amqp_client:delete_exchange(LinkPair, XName)),
     %% When we publish the next message, we expect:
     %% 1. that the message is released because the exchange doesn't exist anymore, and
-    DTag6 = <<"tag 6">>,
-    ok = amqp10_client:send_msg(Sender3, amqp10_msg:new(DTag6, <<"not routed">>, false)),
-    ok = wait_for_settlement(DTag6, released),
+    DTag7 = <<"tag 7">>,
+    ok = amqp10_client:send_msg(Sender3, amqp10_msg:new(DTag7, <<"not routed">>, false)),
+    ok = wait_for_settlement(DTag7, released),
     %% 2. that the server closes the link, i.e. sends us a DETACH frame.
     ExpectedError = #'v1_0.error'{condition = ?V_1_0_AMQP_ERROR_RESOURCE_DELETED},
     receive {amqp10_event, {link, Sender3, {detached, ExpectedError}}} -> ok
