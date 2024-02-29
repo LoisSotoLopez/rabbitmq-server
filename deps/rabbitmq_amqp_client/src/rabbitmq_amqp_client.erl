@@ -9,6 +9,7 @@
 -feature(maybe_expr, enable).
 
 -export[attach_management_link_pair_sync/2,
+        detach_management_link_pair_sync/1,
         declare_queue/2,
         declare_exchange/2,
         bind_queue/5,
@@ -80,6 +81,38 @@ attach(Session, AttachArgs) ->
 await_attached(Ref) ->
     receive
         {amqp10_event, {link, Ref, attached}} ->
+            ok;
+        {amqp10_event, {link, Ref, {detached, Err}}} ->
+            {error, Err}
+    after ?TIMEOUT ->
+              {error, timeout}
+    end.
+
+-spec detach_management_link_pair_sync(link_pair()) ->
+    ok | {error, term()}.
+detach_management_link_pair_sync(
+  #link_pair{outgoing_link = OutgoingLink,
+             incoming_link = IncomingLink}) ->
+    maybe
+        ok ?= detach(OutgoingLink),
+        ok ?= detach(IncomingLink),
+        ok ?= await_detached(OutgoingLink),
+        await_detached(IncomingLink)
+    end.
+
+-spec detach(amqp10_client:link_ref()) ->
+    ok | {error, term()}.
+detach(Ref) ->
+    try amqp10_client:detach_link(Ref)
+    catch exit:Reason ->
+              {error, Reason}
+    end.
+
+-spec await_detached(amqp10_client:link_ref()) ->
+    ok | {error, term()}.
+await_detached(Ref) ->
+    receive
+        {amqp10_event, {link, Ref, {detached, normal}}} ->
             ok;
         {amqp10_event, {link, Ref, {detached, Err}}} ->
             {error, Err}

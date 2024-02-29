@@ -155,6 +155,7 @@ all_management_operations(Config) ->
     ?assertEqual({ok, #{message_count => 0}},
                  rabbitmq_amqp_client:delete_queue(LinkPair, QName)),
 
+    ok = rabbitmq_amqp_client:detach_management_link_pair_sync(LinkPair),
     ok = amqp10_client:end_session(Session),
     ok = amqp10_client:close_connection(Connection).
 

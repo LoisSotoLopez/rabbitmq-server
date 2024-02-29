@@ -78,7 +78,7 @@
 %% For AMQP management operations, we require a link pair as described in
 %% https://docs.oasis-open.org/amqp/linkpair/v1.0/cs01/linkpair-v1.0-cs01.html
 -record(management_link_pair, {
-          client_terminus_address :: tuple(),
+          client_terminus_address,
           incoming_half :: unattached | link_handle(),
           outgoing_half :: unattached | link_handle()
          }).
@@ -253,6 +253,8 @@
 
           queue_states = rabbit_queue_type:init() :: rabbit_queue_type:state()
          }).
+
+-type state() :: #state{}.
 
 start_link(ReaderPid, WriterPid, ChannelNum, FrameMax, User, Vhost, ConnName, BeginFrame) ->
     Args = {ReaderPid, WriterPid, ChannelNum, FrameMax, User, Vhost, ConnName, BeginFrame},
@@ -1138,10 +1140,11 @@ handle_control(Detach = #'v1_0.detach'{handle = ?UINT(HandleInt)},
               {Unsettled1, _RemovedMsgIds} = remove_link_from_outgoing_unsettled_map(Ctag, Unsettled0),
               {QStates0, Unsettled1, OutgoingLinks0}
       end,
-    State = State0#state{queue_states = QStates,
-                         incoming_links = maps:remove(HandleInt, IncomingLinks),
-                         outgoing_links = OutgoingLinks,
-                         outgoing_unsettled_map = Unsettled},
+    State1 = State0#state{queue_states = QStates,
+                          incoming_links = maps:remove(HandleInt, IncomingLinks),
+                          outgoing_links = OutgoingLinks,
+                          outgoing_unsettled_map = Unsettled},
+    State = maybe_detach_mgmt_link(HandleInt, State1),
     maybe_detach_reply(Detach, State, State0),
     publisher_or_consumer_deleted(State, State0),
     {noreply, State};
@@ -2455,19 +2458,60 @@ publisher_or_consumer_deleted(
 
 %% If we previously already sent a detach with an error condition, and the Detach we
 %% receive here is therefore the client's reply, do not reply again with a 3rd detach.
-maybe_detach_reply(Detach,
-                   #state{incoming_links = NewIncomingLinks,
-                          outgoing_links = NewOutgoingLinks,
-                          cfg = #cfg{writer_pid = WriterPid,
-                                     channel_num = Ch}},
-                   #state{incoming_links = OldIncomingLinks,
-                          outgoing_links = OldOutgoingLinks})
+maybe_detach_reply(
+  Detach,
+  #state{incoming_links = NewIncomingLinks,
+         outgoing_links = NewOutgoingLinks,
+         incoming_management_links = NewIncomingMgmtLinks,
+         outgoing_management_links = NewOutgoingMgmtLinks,
+         cfg = #cfg{writer_pid = WriterPid,
+                    channel_num = Ch}},
+  #state{incoming_links = OldIncomingLinks,
+         outgoing_links = OldOutgoingLinks,
+         incoming_management_links = OldIncomingMgmtLinks,
+         outgoing_management_links = OldOutgoingMgmtLinks})
   when map_size(NewIncomingLinks) < map_size(OldIncomingLinks) orelse
-       map_size(NewOutgoingLinks) < map_size(OldOutgoingLinks) ->
+       map_size(NewOutgoingLinks) < map_size(OldOutgoingLinks) orelse
+       map_size(NewIncomingMgmtLinks) < map_size(OldIncomingMgmtLinks) orelse
+       map_size(NewOutgoingMgmtLinks) < map_size(OldOutgoingMgmtLinks) ->
     Reply = Detach#'v1_0.detach'{error = undefined},
     rabbit_amqp_writer:send_command(WriterPid, Ch, Reply);
 maybe_detach_reply(_, _, _) ->
     ok.
+
+-spec maybe_detach_mgmt_link(link_handle(), state()) -> state().
+maybe_detach_mgmt_link(
+  HandleInt,
+  State = #state{management_link_pairs = LinkPairs0,
+                 incoming_management_links = IncomingLinks0,
+                 outgoing_management_links = OutgoingLinks0}) ->
+    case maps:take(HandleInt, IncomingLinks0) of
+        {#management_link{name = Name}, IncomingLinks} ->
+            Pair = #management_link_pair{outgoing_half = OutgoingHalf} = maps:get(Name, LinkPairs0),
+            LinkPairs = case OutgoingHalf of
+                            unattached ->
+                                maps:remove(Name, LinkPairs0);
+                            _ ->
+                                maps:update(Name, Pair#management_link_pair{incoming_half = unattached}, LinkPairs0)
+                        end,
+            State#state{incoming_management_links = IncomingLinks,
+                        management_link_pairs = LinkPairs};
+        error ->
+            case maps:take(HandleInt, OutgoingLinks0) of
+                {#management_link{name = Name}, OutgoingLinks} ->
+                    Pair = #management_link_pair{incoming_half = IncomingHalf} = maps:get(Name, LinkPairs0),
+                    LinkPairs = case IncomingHalf of
+                                    unattached ->
+                                        maps:remove(Name, LinkPairs0);
+                                    _ ->
+                                        maps:update(Name, Pair#management_link_pair{outgoing_half = unattached}, LinkPairs0)
+                                end,
+                    State#state{outgoing_management_links = OutgoingLinks,
+                                management_link_pairs = LinkPairs};
+                error ->
+                    State
+            end
+    end.
 
 check_internal_exchange(#exchange{internal = true,
                                   name = XName}) ->
