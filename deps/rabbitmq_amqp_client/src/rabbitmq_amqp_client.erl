@@ -20,7 +20,7 @@
         delete_exchange/2
        ].
 
--define(TIMEOUT, 10_000).
+-define(TIMEOUT, 15_000).
 -define(MANAGEMENT_NODE_ADDRESS, <<"$management">>).
 
 -record(link_pair, {outgoing_link :: amqp10_client:link_ref(),
@@ -89,9 +89,7 @@ await_attached(Ref) ->
 
 -spec declare_queue(link_pair(), queue_properties()) ->
     {ok, map()} | {error, term()}.
-declare_queue(#link_pair{outgoing_link = OutgoingLink,
-                         incoming_link = IncomingLink},
-              QueueProperties) ->
+declare_queue(LinkPair, QueueProperties) ->
     Body0 = maps:fold(
               fun(name, V, Acc) when is_binary(V) ->
                       [{{utf8, <<"name">>}, {utf8, V}} | Acc];
@@ -112,85 +110,41 @@ declare_queue(#link_pair{outgoing_link = OutgoingLink,
     Body1 = {map, Body0},
     Body = iolist_to_binary(amqp10_framing:encode_bin(Body1)),
 
-    MessageId = message_id(),
     HttpMethod = <<"POST">>,
     HttpRequestTarget = <<"/$management/entities">>,
     ContentType = <<"application/amqp-management+amqp;type=entity">>,
-    Props = #{message_id => {binary, MessageId},
-              to => HttpRequestTarget,
+    Props = #{to => HttpRequestTarget,
               subject => HttpMethod,
-              reply_to => <<"$me">>,
               content_type => ContentType},
-    Req0 = amqp10_msg:new(<<>>, Body, true),
-    Req = amqp10_msg:set_properties(Props, Req0),
 
-    ok = amqp10_client:flow_link_credit(IncomingLink, 1, never),
-    maybe
-        ok ?= amqp10_client:send_msg(OutgoingLink, Req),
-        {ok, Resp} ?= receive {amqp10_msg, IncomingLink, Message} -> {ok, Message}
-                      after ?TIMEOUT -> {error, response_timeout}
-                      end,
-        #{correlation_id := MessageId,
-          subject := <<"201">>,
-          content_type := <<"application/amqp-management+amqp;type=entity-collection">>
-         } = amqp10_msg:properties(Resp),
-        #{<<"http:response">> := <<"1.1">>,
-          <<"location">> := _QueueURI
-         } = amqp10_msg:application_properties(Resp),
-        RespBody = amqp10_msg:body_bin(Resp),
-        [{map, KVList}] = amqp10_framing:decode_bin(RespBody),
-        {ok, proplists:to_map(KVList)}
+    case request(LinkPair, Props, Body) of
+        {ok, Resp} ->
+            case amqp10_msg:properties(Resp) of
+                #{subject := <<"201">>,
+                  content_type := <<"application/amqp-management+amqp;type=entity-collection">>} ->
+                    RespBody = amqp10_msg:body_bin(Resp),
+                    [{map, KVList}] = amqp10_framing:decode_bin(RespBody),
+                    {ok, proplists:to_map(KVList)};
+                _ ->
+                    {error, Resp}
+            end;
+        Err ->
+            Err
     end.
 
 -spec bind_queue(link_pair(), binary(), binary(), binary(), #{binary() => amqp10_prim()}) ->
     ok | {error, term()}.
-bind_queue(#link_pair{outgoing_link = OutgoingLink,
-                      incoming_link = IncomingLink},
-           QueueName, ExchangeName, BindingKey, BindingArguments) ->
-    KVList = maps:fold(
-               fun(Key, TaggedVal = {T, _}, L)
-                     when is_binary(Key) andalso is_atom(T) ->
-                       [{{utf8, Key}, TaggedVal} | L]
-               end, [], BindingArguments),
-    Body0 = {map, [
-                   {{utf8, <<"source">>}, {utf8, ExchangeName}},
-                   {{utf8, <<"binding_key">>}, {utf8, BindingKey}},
-                   {{utf8, <<"arguments">>}, {map, KVList}}
-                  ]},
-    Body = iolist_to_binary(amqp10_framing:encode_bin(Body0)),
-
-    MessageId = message_id(),
-    HttpMethod = <<"POST">>,
-    HttpRequestTarget = <<"/$management/queues/", QueueName/binary, "/$management/entities">>,
-    ContentType = <<"application/amqp-management+amqp;type=entity">>,
-    Props = #{message_id => {binary, MessageId},
-              to => HttpRequestTarget,
-              subject => HttpMethod,
-              reply_to => <<"$me">>,
-              content_type => ContentType},
-    Req0 = amqp10_msg:new(<<>>, Body, true),
-    Req = amqp10_msg:set_properties(Props, Req0),
-
-    ok = amqp10_client:flow_link_credit(IncomingLink, 1, never),
-    maybe
-        ok ?= amqp10_client:send_msg(OutgoingLink, Req),
-        {ok, Resp} ?= receive {amqp10_msg, IncomingLink, Message} -> {ok, Message}
-                      after ?TIMEOUT -> {error, response_timeout}
-                      end,
-        #{correlation_id := MessageId,
-          subject := <<"201">>
-         } = amqp10_msg:properties(Resp),
-        #{<<"http:response">> := <<"1.1">>,
-          <<"location">> := _BindingRUI
-         } = amqp10_msg:application_properties(Resp),
-        ok
-    end.
+bind_queue(LinkPair, QueueName, ExchangeName, BindingKey, BindingArguments) ->
+    bind(<<"queues">>, LinkPair, QueueName, ExchangeName, BindingKey, BindingArguments).
 
 -spec bind_exchange(link_pair(), binary(), binary(), binary(), #{binary() => amqp10_prim()}) ->
     ok | {error, term()}.
-bind_exchange(#link_pair{outgoing_link = OutgoingLink,
-                         incoming_link = IncomingLink},
-              Destination, Source, BindingKey, BindingArguments) ->
+bind_exchange(LinkPair, Destination, Source, BindingKey, BindingArguments) ->
+    bind(<<"exchanges">>, LinkPair, Destination, Source, BindingKey, BindingArguments).
+
+-spec bind(binary(), link_pair(), binary(), binary(), binary(), #{binary() => amqp10_prim()}) ->
+    ok | {error, term()}.
+bind(Type, LinkPair, Destination, Source, BindingKey, BindingArguments) ->
     KVList = maps:fold(
                fun(Key, TaggedVal = {T, _}, L)
                      when is_binary(Key) andalso is_atom(T) ->
@@ -203,31 +157,26 @@ bind_exchange(#link_pair{outgoing_link = OutgoingLink,
                   ]},
     Body = iolist_to_binary(amqp10_framing:encode_bin(Body0)),
 
-    MessageId = message_id(),
     HttpMethod = <<"POST">>,
-    HttpRequestTarget = <<"/$management/exchanges/", Destination/binary, "/$management/entities">>,
+    HttpRequestTarget = <<"/$management/",
+                          Type/binary, "/",
+                          Destination/binary,
+                          "/$management/entities">>,
     ContentType = <<"application/amqp-management+amqp;type=entity">>,
-    Props = #{message_id => {binary, MessageId},
-              to => HttpRequestTarget,
+    Props = #{to => HttpRequestTarget,
               subject => HttpMethod,
-              reply_to => <<"$me">>,
               content_type => ContentType},
-    Req0 = amqp10_msg:new(<<>>, Body, true),
-    Req = amqp10_msg:set_properties(Props, Req0),
 
-    ok = amqp10_client:flow_link_credit(IncomingLink, 1, never),
-    maybe
-        ok ?= amqp10_client:send_msg(OutgoingLink, Req),
-        {ok, Resp} ?= receive {amqp10_msg, IncomingLink, Message} -> {ok, Message}
-                      after ?TIMEOUT -> {error, response_timeout}
-                      end,
-        #{correlation_id := MessageId,
-          subject := <<"201">>
-         } = amqp10_msg:properties(Resp),
-        #{<<"http:response">> := <<"1.1">>,
-          <<"location">> := _BindingRUI
-         } = amqp10_msg:application_properties(Resp),
-        ok
+    case request(LinkPair, Props, Body) of
+        {ok, Resp} ->
+            case amqp10_msg:properties(Resp) of
+                #{subject := <<"201">>} ->
+                    ok;
+                _ ->
+                    {error, Resp}
+            end;
+        Err ->
+            Err
     end.
 
 -spec unbind_queue(link_pair(), binary(), binary(), binary(), #{binary() => amqp10_prim()}) ->
@@ -242,47 +191,38 @@ unbind_exchange(LinkPair, DestinationExchange, SourceExchange, BindingKey, Bindi
 
 -spec unbind(binary(), link_pair(), binary(), binary(), binary(), #{binary() => amqp10_prim()}) ->
     ok | {error, term()}.
-unbind(Type,
-       #link_pair{outgoing_link = OutgoingLink,
-                  incoming_link = IncomingLink} = LinkPair,
-       Destination, Source, BindingKey, BindingArguments) ->
-    MessageId = message_id(),
+unbind(Type, LinkPair, Destination, Source, BindingKey, BindingArguments) ->
     HttpMethod = <<"GET">>,
     HttpRequestTarget = <<"/$management/",
                           Type/binary, "/",
                           Destination/binary,
                           "/$management/bindings?source=", Source/binary>>,
-    Props = #{message_id => {binary, MessageId},
-              to => HttpRequestTarget,
-              subject => HttpMethod,
-              reply_to => <<"$me">>},
-    Req0 = amqp10_msg:new(<<>>, <<>>, true),
-    Req = amqp10_msg:set_properties(Props, Req0),
+    Props = #{to => HttpRequestTarget,
+              subject => HttpMethod},
 
-    ok = amqp10_client:flow_link_credit(IncomingLink, 1, never),
-    maybe
-        ok ?= amqp10_client:send_msg(OutgoingLink, Req),
-        {ok, Resp} ?= receive {amqp10_msg, IncomingLink, Message} -> {ok, Message}
-                      after ?TIMEOUT -> {error, response_timeout}
-                      end,
-        #{correlation_id := MessageId,
-          subject := <<"200">>,
-          content_type := <<"application/amqp-management+amqp">>
-         } = amqp10_msg:properties(Resp),
-        #{<<"http:response">> := <<"1.1">> } = amqp10_msg:application_properties(Resp),
-        RespBody = amqp10_msg:body_bin(Resp),
-        [{list, Bindings}] = amqp10_framing:decode_bin(RespBody),
-        case binding_uri(BindingKey, BindingArguments, Bindings) of
-            {ok, Uri} ->
-                ok = delete_binding(LinkPair, Uri);
-            not_found ->
-                ok
-        end
+    case request(LinkPair, Props, <<>>) of
+        {ok, Resp} ->
+            case amqp10_msg:properties(Resp) of
+                #{subject := <<"200">>,
+                  content_type := <<"application/amqp-management+amqp">>} ->
+                    RespBody = amqp10_msg:body_bin(Resp),
+                    [{list, Bindings}] = amqp10_framing:decode_bin(RespBody),
+                    case search_binding_uri(BindingKey, BindingArguments, Bindings) of
+                        {ok, Uri} ->
+                            delete_binding(LinkPair, Uri);
+                        not_found ->
+                            ok
+                    end;
+                _ ->
+                    {error, Resp}
+            end;
+        Err ->
+            Err
     end.
 
-binding_uri(_, _, []) ->
+search_binding_uri(_, _, []) ->
     not_found;
-binding_uri(BindingKey, BindingArguments, [{map, KVList} | Bindings]) ->
+search_binding_uri(BindingKey, BindingArguments, [{map, KVList} | Bindings]) ->
     case maps:from_list(KVList) of
         #{{utf8, <<"binding_key">>} := {utf8, BindingKey},
           {utf8, <<"arguments">>} := {map, Args},
@@ -294,110 +234,73 @@ binding_uri(BindingKey, BindingArguments, [{map, KVList} | Bindings]) ->
                 true ->
                     {ok, Uri};
                 false ->
-                    binding_uri(BindingKey, BindingArguments, Bindings)
+                    search_binding_uri(BindingKey, BindingArguments, Bindings)
             end;
         _ ->
-            binding_uri(BindingKey, BindingArguments, Bindings)
+            search_binding_uri(BindingKey, BindingArguments, Bindings)
     end.
 
 -spec delete_binding(link_pair(), binary()) ->
     ok | {error, term()}.
-delete_binding(#link_pair{outgoing_link = OutgoingLink,
-                          incoming_link = IncomingLink}, BindingUri) ->
-    MessageId = message_id(),
+delete_binding(LinkPair, BindingUri) ->
     HttpMethod = <<"DELETE">>,
-    Props = #{message_id => {binary, MessageId},
-              to => BindingUri,
-              subject => HttpMethod,
-              reply_to => <<"$me">>},
-    Req0 = amqp10_msg:new(<<>>, <<>>, true),
-    Req = amqp10_msg:set_properties(Props, Req0),
+    Props = #{to => BindingUri,
+              subject => HttpMethod},
 
-    ok = amqp10_client:flow_link_credit(IncomingLink, 1, never),
-    maybe
-        ok ?= amqp10_client:send_msg(OutgoingLink, Req),
-        {ok, Resp} ?= receive {amqp10_msg, IncomingLink, Message} -> {ok, Message}
-                      after ?TIMEOUT -> {error, response_timeout}
-                      end,
-        #{correlation_id := MessageId,
-          subject := <<"204">>} = amqp10_msg:properties(Resp),
-        #{<<"http:response">> := <<"1.1">> } = amqp10_msg:application_properties(Resp),
-        ok
+    case request(LinkPair, Props, <<>>) of
+        {ok, Resp} ->
+            case amqp10_msg:properties(Resp) of
+                #{subject := <<"204">>} ->
+                    ok;
+                _ ->
+                    {error, Resp}
+            end;
+        Err ->
+            Err
     end.
 
 -spec purge_queue(link_pair(), binary()) ->
     {ok, map()} | {error, term()}.
-purge_queue(#link_pair{outgoing_link = OutgoingLink,
-                       incoming_link = IncomingLink},
-            QueueName) ->
-    MessageId = message_id(),
+purge_queue(LinkPair, QueueName) ->
     HttpMethod = <<"POST">>,
     HttpRequestTarget = <<"/$management/queues/", QueueName/binary, "/$management/purge">>,
-    Props = #{message_id => {binary, MessageId},
-              to => HttpRequestTarget,
-              subject => HttpMethod,
-              reply_to => <<"$me">>},
-    Req0 = amqp10_msg:new(<<>>, <<>>, true),
-    Req = amqp10_msg:set_properties(Props, Req0),
-
-    ok = amqp10_client:flow_link_credit(IncomingLink, 1, never),
-    maybe
-        ok ?= amqp10_client:send_msg(OutgoingLink, Req),
-        {ok, Resp} ?= receive {amqp10_msg, IncomingLink, Message} -> {ok, Message}
-                      after ?TIMEOUT -> {error, response_timeout}
-                      end,
-        #{correlation_id := MessageId,
-          subject := <<"200">>,
-          content_type := <<"application/amqp-management+amqp">>
-         } = amqp10_msg:properties(Resp),
-        #{<<"http:response">> := <<"1.1">> } = amqp10_msg:application_properties(Resp),
-        RespBody = amqp10_msg:body_bin(Resp),
-        [{map, [
-                {{utf8, <<"message_count">>}, {ulong, Count}}
-               ]
-         }] = amqp10_framing:decode_bin(RespBody),
-        {ok, #{message_count => Count}}
-    end.
+    Props = #{to => HttpRequestTarget,
+              subject => HttpMethod},
+    purge_or_delete_queue(LinkPair, Props).
 
 -spec delete_queue(link_pair(), binary()) ->
     {ok, map()} | {error, term()}.
-delete_queue(#link_pair{outgoing_link = OutgoingLink,
-                        incoming_link = IncomingLink},
-             QueueName) ->
-    MessageId = message_id(),
+delete_queue(LinkPair, QueueName) ->
     HttpMethod = <<"DELETE">>,
     HttpRequestTarget = <<"/$management/queues/", QueueName/binary>>,
-    Props = #{message_id => {binary, MessageId},
-              to => HttpRequestTarget,
-              subject => HttpMethod,
-              reply_to => <<"$me">>},
-    Req0 = amqp10_msg:new(<<>>, <<>>, true),
-    Req = amqp10_msg:set_properties(Props, Req0),
+    Props = #{to => HttpRequestTarget,
+              subject => HttpMethod},
+    purge_or_delete_queue(LinkPair, Props).
 
-    ok = amqp10_client:flow_link_credit(IncomingLink, 1, never),
-    maybe
-        ok ?= amqp10_client:send_msg(OutgoingLink, Req),
-        {ok, Resp} ?= receive {amqp10_msg, IncomingLink, Message} -> {ok, Message}
-                      after ?TIMEOUT -> {error, response_timeout}
-                      end,
-        #{correlation_id := MessageId,
-          subject := <<"200">>,
-          content_type := <<"application/amqp-management+amqp">>
-         } = amqp10_msg:properties(Resp),
-        #{<<"http:response">> := <<"1.1">> } = amqp10_msg:application_properties(Resp),
-        RespBody = amqp10_msg:body_bin(Resp),
-        [{map, [
-                {{utf8, <<"message_count">>}, {ulong, Count}}
-               ]
-         }] = amqp10_framing:decode_bin(RespBody),
-        {ok, #{message_count => Count}}
+-spec purge_or_delete_queue(link_pair(), amqp10_msg:amqp10_properties()) ->
+    {ok, map()} | {error, term()}.
+purge_or_delete_queue(LinkPair, Props) ->
+    case request(LinkPair, Props, <<>>) of
+        {ok, Resp} ->
+            case amqp10_msg:properties(Resp) of
+                #{subject := <<"200">>,
+                  content_type := <<"application/amqp-management+amqp">>} ->
+                    RespBody = amqp10_msg:body_bin(Resp),
+                    [{map, [
+                            {{utf8, <<"message_count">>}, {ulong, Count}}
+                           ]
+                     }] = amqp10_framing:decode_bin(RespBody),
+                    {ok, #{message_count => Count}};
+                _ ->
+                    {error, Resp}
+            end;
+        Err ->
+            Err
     end.
 
 -spec declare_exchange(link_pair(), exchange_properties()) ->
     {ok, map()} | {error, term()}.
-declare_exchange(#link_pair{outgoing_link = OutgoingLink,
-                            incoming_link = IncomingLink},
-                 ExchangeProperties) ->
+declare_exchange(LinkPair, ExchangeProperties) ->
     Body0 = maps:fold(
               fun(name, V, Acc) when is_binary(V) ->
                       [{{utf8, <<"name">>}, {utf8, V}} | Acc];
@@ -420,62 +323,67 @@ declare_exchange(#link_pair{outgoing_link = OutgoingLink,
     Body1 = {map, Body0},
     Body = iolist_to_binary(amqp10_framing:encode_bin(Body1)),
 
-    MessageId = message_id(),
     HttpMethod = <<"POST">>,
     HttpRequestTarget = <<"/$management/entities">>,
     ContentType = <<"application/amqp-management+amqp;type=entity">>,
-    Props = #{message_id => {binary, MessageId},
-              to => HttpRequestTarget,
+    Props = #{to => HttpRequestTarget,
               subject => HttpMethod,
-              reply_to => <<"$me">>,
               content_type => ContentType},
-    Req0 = amqp10_msg:new(<<>>, Body, true),
-    Req = amqp10_msg:set_properties(Props, Req0),
 
-    ok = amqp10_client:flow_link_credit(IncomingLink, 1, never),
-    maybe
-        ok ?= amqp10_client:send_msg(OutgoingLink, Req),
-        {ok, Resp} ?= receive {amqp10_msg, IncomingLink, Message} -> {ok, Message}
-                      after ?TIMEOUT -> {error, response_timeout}
-                      end,
-        #{correlation_id := MessageId,
-          subject := <<"201">>,
-          content_type := <<"application/amqp-management+amqp;type=entity-collection">>
-         } = amqp10_msg:properties(Resp),
-        #{<<"http:response">> := <<"1.1">>,
-          <<"location">> := _ExchangeURI
-         } = amqp10_msg:application_properties(Resp),
-        RespBody = amqp10_msg:body_bin(Resp),
-        [{map, KVList}] = amqp10_framing:decode_bin(RespBody),
-        {ok, proplists:to_map(KVList)}
+    case request(LinkPair, Props, Body) of
+        {ok, Resp} ->
+            case amqp10_msg:properties(Resp) of
+                #{subject := <<"201">>,
+                  content_type := <<"application/amqp-management+amqp;type=entity-collection">>} ->
+                    RespBody = amqp10_msg:body_bin(Resp),
+                    [{map, KVList}] = amqp10_framing:decode_bin(RespBody),
+                    {ok, proplists:to_map(KVList)};
+                _ ->
+                    {error, Resp}
+            end;
+        Err ->
+            Err
     end.
 
 -spec delete_exchange(link_pair(), binary()) ->
     ok | {error, term()}.
-delete_exchange(#link_pair{outgoing_link = OutgoingLink,
-                           incoming_link = IncomingLink},
-                ExchangeName) ->
-    MessageId = message_id(),
+delete_exchange(LinkPair, ExchangeName) ->
     HttpMethod = <<"DELETE">>,
     HttpRequestTarget = <<"/$management/exchanges/", ExchangeName/binary>>,
-    Props = #{message_id => {binary, MessageId},
-              to => HttpRequestTarget,
-              subject => HttpMethod,
-              reply_to => <<"$me">>},
-    Req0 = amqp10_msg:new(<<>>, <<>>, true),
-    Req = amqp10_msg:set_properties(Props, Req0),
+    Props = #{to => HttpRequestTarget,
+              subject => HttpMethod},
+    case request(LinkPair, Props, <<>>) of
+        {ok, Resp} ->
+            case amqp10_msg:properties(Resp) of
+                #{subject := <<"204">>} ->
+                    ok;
+                _ ->
+                    {error, Resp}
+            end;
+        Err ->
+            Err
+    end.
 
+-spec request(link_pair(), amqp10_msg:amqp10_properties(), binary()) ->
+    {ok, Response :: amqp10_msg:amqp10_msg()} | {error, term()}.
+request(#link_pair{outgoing_link = OutgoingLink,
+                   incoming_link = IncomingLink}, Properties, Body) ->
+    MessageId = message_id(),
+    Properties1 = Properties#{message_id => {binary, MessageId},
+                              reply_to => <<"$me">>},
+    Request = amqp10_msg:new(<<>>, Body, true),
+    Request1 =  amqp10_msg:set_properties(Properties1, Request),
     ok = amqp10_client:flow_link_credit(IncomingLink, 1, never),
-    maybe
-        ok ?= amqp10_client:send_msg(OutgoingLink, Req),
-        {ok, Resp} ?= receive {amqp10_msg, IncomingLink, Message} -> {ok, Message}
-                      after ?TIMEOUT -> {error, response_timeout}
-                      end,
-        #{correlation_id := MessageId,
-          subject := <<"204">>
-         } = amqp10_msg:properties(Resp),
-        #{<<"http:response">> := <<"1.1">> } = amqp10_msg:application_properties(Resp),
-        ok
+    case amqp10_client:send_msg(OutgoingLink, Request1) of
+        ok ->
+            receive {amqp10_msg, IncomingLink, Response} ->
+                        #{correlation_id := MessageId} = amqp10_msg:properties(Response),
+                        {ok, Response}
+            after ?TIMEOUT ->
+                      {error, response_timeout}
+            end;
+        Err ->
+            Err
     end.
 
 %% "The message producer is usually responsible for setting the message-id in
